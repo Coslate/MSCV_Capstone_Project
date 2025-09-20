@@ -1,0 +1,3 @@
+name: "nuscenes"
+root: "/path/to/nuscenes"
+sample_token: "REPLACE_WITH_SAMPLE_TOKEN"

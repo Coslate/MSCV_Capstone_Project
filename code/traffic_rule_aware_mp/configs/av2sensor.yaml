@@ -1,0 +1,3 @@
+name: "av2sensor"
+av2_log_dir: "/path/to/argoverse2/log_dir"
+root: ""
