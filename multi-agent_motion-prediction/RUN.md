@@ -90,17 +90,77 @@ python scripts/make_splits.py \
   --out_dir /data/patrick/packed_nuscenes_v2_parallel/splits \
   --train_ratio 0.8 --val_ratio 0.1 --test_ratio 0.1 --seed 2025
 
-head -n 2000 /data/patrick/packed_nuscenes_v1/splits/manifest.train.jsonl > /data/patrick/packed_nuscenes_v1/splits/mini/manifest.train_5k.jsonl
+head -n 2000 /data/patrick/packed_nuscenes_v1/splits/manifest.train.jsonl > /data/patrick/packed_nuscenes_v1/splits/mini/manifest.train_2k.jsonl
 head -n 500 /data/patrick/packed_nuscenes_v1/splits/manifest.val.jsonl > /data/patrick/packed_nuscenes_v1/splits/mini/manifest.val_500.jsonl
 
 # Train on mini for testing
-python scripts/train.py \
-  --train_manifest /data/patrick/packed_nuscenes_v1/splits/mini/manifest.train_5k.jsonl \
+python -m scripts.train \
+  --train_manifest /data/patrick/packed_nuscenes_v1/splits/mini/manifest.train_2k.jsonl \
   --val_manifest   /data/patrick/packed_nuscenes_v1/splits/mini/manifest.val_500.jsonl \
   --batch_size 32 \
   --epochs 1 \
-  --val_every 100 \
+  --val_every 10 \
   --lr 1e-3 \
+  --no_lr_sched \
+  --warmup_ratio 0.05 \
+  --min_lr 1e-5 \
+  --warmup_init_lr 1e-5 \
   --hidden 128 --num_layers 1 --d_model 128 \
   --device cuda \
-  --out_dir runs/baseline_single_2k
+  --amp_dtype fp16 \
+  --out_dir runs/baseline_single_2k \
+  --wandb --wandb_project multi-agent-motion-prediction --wandb_run_name mmp_bl_single_2k \
+  --log_every 1
+
+# Train on full dataset
+python -m scripts.train \
+  --train_manifest /data/patrick/packed_nuscenes_v1/splits/manifest.train.jsonl \
+  --val_manifest   /data/patrick/packed_nuscenes_v1/splits/manifest.val.jsonl \
+  --batch_size 32 \
+  --epochs 12 \
+  --val_every 200 \
+  --lr 1e-3 \
+  --no_lr_sched \
+  --warmup_ratio 0.03 \
+  --min_lr 1e-4 \
+  --warmup_init_lr 1e-4 \
+  --hidden 128 --num_layers 1 --d_model 128 \
+  --device cuda \
+  --amp_dtype fp16 \
+  --out_dir runs/baseline_fulldataset_12k_nosched \
+  --wandb --wandb_project multi-agent-motion-prediction --wandb_run_name mmp_bl_fulldataset_12k_lr_nosched \
+  --log_every 10
+
+python -m scripts.train \
+  --train_manifest /data/patrick/packed_nuscenes_v1/splits/manifest.train.jsonl \
+  --val_manifest   /data/patrick/packed_nuscenes_v1/splits/manifest.val.jsonl \
+  --batch_size 32 \
+  --epochs 12 \
+  --val_every 200 \
+  --lr 1e-3 \
+  --warmup_ratio 0.03 \
+  --min_lr 1e-4 \
+  --warmup_init_lr 1e-4 \
+  --hidden 128 --num_layers 1 --d_model 128 \
+  --device cuda \
+  --amp_dtype fp16 \
+  --out_dir runs/mmp_bl_fulldataset_12k_lr_warmupcos_lr1e-3_wup0.03_minlr1e-4_e12 \
+  --wandb --wandb_project multi-agent-motion-prediction --wandb_run_name mmp_bl_fulldataset_12k_lr_warmupcos_lr1e-3_wup0.03_minlr1e-4_e12 \
+  --log_every 10
+
+python -m scripts.train \
+  --train_manifest /data/patrick/packed_nuscenes_v1/splits/manifest.train.jsonl \
+  --val_manifest   /data/patrick/packed_nuscenes_v1/splits/manifest.val.jsonl \
+  --batch_size 32 \
+  --epochs 15 \
+  --val_every 200 \
+  --lr 3e-3 \
+  --warmup_ratio 0.05 \
+  --min_lr 3e-4 \
+  --warmup_init_lr 1e-4 \
+  --hidden 128 --num_layers 1 --d_model 128 \
+  --device cuda \
+  --amp_dtype fp16 \
+  --out_dir runs/mmp_bl_fulldataset_12k_lr_warmupcos_lr3e-3_wup0.05_minlr3e-4_e15 \
+  --wandb --wandb_project multi-agent-motion-prediction --wandb_run_name mmp_bl_fulldataset_12k_lr_warmupcos_lr3e-3_wup0.05_minlr3e-4_e15 \
+  --log_every 10

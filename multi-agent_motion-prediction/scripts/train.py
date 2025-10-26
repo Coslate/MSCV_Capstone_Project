@@ -3,28 +3,49 @@ import os, argparse, math, json
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
-from datasets.packed_nuscenes_dataset import PackedNuScenesDataset, packed_nuscenes_collate
+from dataset.packed_nuscenes_dataset import PackedNuScenesDataset, packed_nuscenes_collate
 from models.baselines import GRUSingleRollout, GRUMultiRollout
 from metrics.trajectory_metrics import ade_fde_single, metrics_multirollout
+from torch.optim.lr_scheduler import SequentialLR, LinearLR, CosineAnnealingLR
+from torch import amp
+from tqdm import tqdm
 
 # ----------------- Loss helpers -----------------
 def masked_l2_loss(pred, gt, mask):
-    # pred, gt: (B,Na,Tf,2); mask: (B,Na,Tf) bool
-    diff = pred - gt
-    l2 = torch.sqrt(torch.clamp((diff**2).sum(dim=-1), min=1e-12))  # (B,Na,Tf)
-    loss = (l2 * mask).sum() / (mask.sum().clamp(min=1))
-    return loss
+    """
+    pred, gt: (B,Na,Tf,2)
+    mask:     (B,Na,Tf) bool
+    """
+    # Expand mask to coords and zero-out invalid entries BEFORE differencing
+    valid = mask.unsqueeze(-1)                      # (B,Na,Tf,1)
+    pred_v = torch.where(valid, pred, torch.zeros_like(pred))
+    gt_v   = torch.where(valid, gt,   torch.zeros_like(gt))   # <-- kills NaNs at invalid spots
+
+    diff = pred_v - gt_v                                # (B,Na,Tf,2)
+    l2   = torch.linalg.norm(diff, dim=-1)              # (B,Na,Tf)
+
+    denom = mask.sum().clamp(min=1)
+    return l2.sum() / denom
 
 def best_of_k_loss(pred_k, gt, mask, logits=None, lambda_cls: float = 0.1):
     """
-    pred_k: (B,Na,K,Tf,2), gt: (B,Na,Tf,2), mask: (B,Na,Tf)
-    回傳：回歸 loss（best-of-K ADE）+（可選）分類 CE loss（winner-take-all）
+    pred_k: (B,Na,K,Tf,2)   gt: (B,Na,Tf,2)    mask: (B,Na,Tf)
+    Winner-take-all best-of-K regression + optional class CE on argmin.
     """
     B, Na, K, Tf, _ = pred_k.shape
-    d = torch.linalg.norm(pred_k - gt.unsqueeze(2), dim=-1)   # (B,Na,K,Tf)
-    counts = mask.sum(-1).clamp(min=1).unsqueeze(2)           # (B,Na,1)
-    ade_bnk = (d * mask.unsqueeze(2)).sum(-1) / counts        # (B,Na,K)
-    min_val, min_idx = ade_bnk.min(dim=2)                     # (B,Na)
+
+    valid = mask.unsqueeze(2).unsqueeze(-1)             # (B,Na,K,Tf,1)
+    gt_e  = gt.unsqueeze(2)                             # (B,Na,1,Tf,2)
+    pred_v = torch.where(valid, pred_k, torch.zeros_like(pred_k))
+    gt_v   = torch.where(valid, gt_e,   torch.zeros_like(gt_e))
+
+    diff   = pred_v - gt_v                              # (B,Na,K,Tf,2)
+    d      = torch.linalg.norm(diff, dim=-1)            # (B,Na,K,Tf)
+
+    counts = mask.sum(dim=-1).clamp(min=1).unsqueeze(2) # (B,Na,1)
+    ade_bk = d.sum(dim=-1) / counts                     # (B,Na,K)
+
+    min_val, min_idx = ade_bk.min(dim=2)                # (B,Na)
     reg = min_val.mean()
 
     if logits is None:
@@ -35,11 +56,19 @@ def best_of_k_loss(pred_k, gt, mask, logits=None, lambda_cls: float = 0.1):
     return reg + lambda_cls * cls, cls, min_idx
 
 # ----------------- Evaluation -----------------
-def run_val(model, dl, device, multirollout: bool, miss_thresh: float = 2.0, K: int = 6, wandb_run=None, step=None):
+def run_val(model, dl, device, multirollout: bool,
+            miss_thresh: float = 2.0, K: int = 6,
+            wandb_run=None, step=None, show_pbar: bool=True, desc: str="Val",
+            lambda_cls: float = 0.1):
     model.eval()
     meter = {}
+    loss_total = 0.0
+    cls_total  = 0.0
+    n_batches  = 0
+
+    iterator = tqdm(dl, desc=desc, dynamic_ncols=True, leave=False) if show_pbar else dl
     with torch.no_grad():
-        for batch in dl:
+        for batch in iterator:
             ag_h = batch["agents_hist_xy"].to(device)
             ag_hm= batch["agents_hist_mask"].to(device)
             eg_h = batch["ego_hist_xy"].to(device)
@@ -48,30 +77,55 @@ def run_val(model, dl, device, multirollout: bool, miss_thresh: float = 2.0, K: 
             gtm  = batch["agents_fut_mask"].to(device)
 
             if not multirollout:
-                pred = model(ag_h, ag_hm, eg_h, eg_hm)           # (B,Na,Tf,2)
+                # forward
+                pred = model(ag_h, ag_hm, eg_h, eg_hm)  # (B,Na,Tf,2)
+                # val loss (same as train objective for single rollout)
+                loss_b = masked_l2_loss(pred, gt, gtm)
+
+                # metrics
                 m = ade_fde_single(pred, gt, gtm)
-                for k,v in m.items():
-                    if isinstance(v, torch.Tensor) and v.ndim==0:
-                        meter[k] = meter.get(k,0.0) + float(v)
+
+                # accumulate
+                loss_total += float(loss_b.item())
+                n_batches  += 1
+                for k, v in m.items():
+                    if isinstance(v, torch.Tensor) and v.ndim == 0:
+                        meter[k] = meter.get(k, 0.0) + float(v)
             else:
-                pred_k, _ = model(ag_h, ag_hm, eg_h, eg_hm)      # (B,Na,K,Tf,2)
-                single_best = pred_k[:, :, 0]                    # optional quick single view
-                m1 = ade_fde_single(single_best, gt, gtm)
-                for k,v in m1.items():
-                    if isinstance(v, torch.Tensor) and v.ndim==0:
-                        meter["single_"+k] = meter.get("single_"+k,0.0) + float(v)
+                # forward (need logits for best_of_k val loss)
+                pred_k, logits = model(ag_h, ag_hm, eg_h, eg_hm)  # (B,Na,K,Tf,2), (B,Na,K)
+
+                # val loss (WTA + optional cls)
+                loss_b, cls_b, _ = best_of_k_loss(pred_k, gt, gtm, logits, lambda_cls=lambda_cls)
+
+                # metrics
+                m1 = ade_fde_single(pred_k[:, :, 0], gt, gtm)  # single-view (K=0) metrics
+                for k, v in m1.items():
+                    if isinstance(v, torch.Tensor) and v.ndim == 0:
+                        meter["single_" + k] = meter.get("single_" + k, 0.0) + float(v)
 
                 m2 = metrics_multirollout(pred_k, gt, gtm, miss_thresh=miss_thresh)
-                for k,v in m2.items():
-                    if isinstance(v, torch.Tensor) and v.ndim==0:
-                        meter[k] = meter.get(k,0.0) + float(v)
-    n = len(dl)
-    for k in list(meter.keys()):
-        meter[k] /= max(n, 1)
+                for k, v in m2.items():
+                    if isinstance(v, torch.Tensor) and v.ndim == 0:
+                        meter[k] = meter.get(k, 0.0) + float(v)
 
-    # log to wandb if provided
+                # accumulate
+                loss_total += float(loss_b.item())
+                cls_total  += float(cls_b.item())
+                n_batches  += 1
+
+    # average over batches
+    if n_batches > 0:
+        meter["loss"] = loss_total / n_batches
+        if multirollout:
+            meter["cls_loss"] = cls_total / n_batches
+        for k in list(meter.keys()):
+            if k not in ("loss", "cls_loss"):
+                meter[k] /= n_batches
+
+    # log to W&B if provided
     if wandb_run is not None:
-        wandb_run.log({f"val/{k}": v for k,v in meter.items()}, step=step)
+        wandb_run.log({f"val/{k}": v for k, v in meter.items()}, step=step)
 
     model.train()
     return meter
@@ -108,6 +162,20 @@ def main():
     ap.add_argument("--miss_thresh", type=float, default=2.0)
     ap.add_argument("--num_workers", type=int, default=8)
     ap.add_argument("--device", default="cuda")
+    ap.add_argument("--amp_dtype", type=str, default="fp16",
+                choices=["fp16", "bf16", "off"],
+                help="AMP precision on CUDA: fp16 (default), bf16, or off")
+
+    ap.add_argument("--warmup_ratio", type=float, default=0.05,
+                    help="warmup steps as a fraction of total training steps")
+    ap.add_argument("--warmup_steps", type=int, default=None,
+                    help="override warmup_ratio with an explicit number of steps")
+    ap.add_argument("--min_lr", type=float, default=1e-6,
+                    help="cosine annealing floor")
+    ap.add_argument("--no_lr_sched", action="store_true",
+                    help="disable LR scheduler (keep constant LR)")
+    ap.add_argument("--warmup_init_lr", type=float, default=None,
+                    help="LR to start warmup from (default: lr * 1e-2).")
 
     # checkpoint I/O
     ap.add_argument("--out_dir", type=str, default="checkpoints",
@@ -133,6 +201,24 @@ def main():
 
     args = ap.parse_args()
 
+    # 選 AMP dtype
+    if args.amp_dtype == "off" or torch.device(args.device).type != "cuda":
+        amp_enabled = False
+        amp_dtype = None
+    else:
+        amp_enabled = True
+        amp_dtype = torch.float16 if args.amp_dtype == "fp16" else torch.bfloat16
+
+    # GradScaler：fp16 才需要；bf16 通常不需要
+    use_scaler = (amp_enabled and amp_dtype is torch.float16)
+    scaler = amp.GradScaler('cuda', enabled=use_scaler)
+
+    #（可選）開 TF32 提升吞吐（不影響 AMP dtype）
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.allow_tf32 = True
+    print(f"[AMP] enabled={amp_enabled} dtype={amp_dtype} scaler={use_scaler}")    
+    print("[AMP] current GPU autocast dtype =", torch.get_autocast_gpu_dtype())
+
     # Datasets / Loaders (train/val/test splits on manifest.jsonl)
     tr_ds = PackedNuScenesDataset(args.train_manifest)
     va_ds = PackedNuScenesDataset(args.val_manifest)
@@ -153,7 +239,32 @@ def main():
                                 num_layers=args.num_layers, d_model=args.d_model).to(device)
         optim = torch.optim.AdamW(model.parameters(), lr=args.lr)
 
-    scaler = torch.cuda.amp.GradScaler(enabled=(device.type=="cuda"))
+    # ---- LR schedule: linear warmup -> cosine anneal ----
+    steps_per_epoch = max(1, len(tr_dl))
+    total_steps = max(args.epochs * steps_per_epoch, 1)
+
+    if args.warmup_steps is not None:
+        warmup_steps = int(args.warmup_steps)
+    else:
+        warmup_steps = int(total_steps * max(args.warmup_ratio, 0.0))
+
+    warmup_steps = max(min(warmup_steps, total_steps - 1), 1)  # clamp
+    scheduler = None
+    if not args.no_lr_sched:
+        if warmup_steps > 0:
+            # choose warmup start LR (default 1% of base LR)
+            warmup_init_lr = args.warmup_init_lr if args.warmup_init_lr is not None else args.lr * 1e-2
+            start_factor = float(warmup_init_lr / max(args.lr, 1e-12))  # must be (0,1]
+            start_factor = min(max(start_factor, 1e-8), 1.0)
+
+            sched_warm = LinearLR(optim, start_factor=start_factor, end_factor=1.0, total_iters=warmup_steps)
+            sched_cos  = CosineAnnealingLR(optim, T_max=max(1, total_steps - warmup_steps), eta_min=args.min_lr)
+            scheduler  = SequentialLR(optim, schedulers=[sched_warm, sched_cos], milestones=[warmup_steps])
+        else:
+            scheduler  = CosineAnnealingLR(optim, T_max=total_steps, eta_min=args.min_lr)
+
+    print(f"[LR] steps/epoch={steps_per_epoch}, total_steps={total_steps}, warmup_steps={warmup_steps}")
+
     os.makedirs(args.out_dir, exist_ok=True)
 
     # ★ init / resume
@@ -178,6 +289,22 @@ def main():
         if "scaler" in ckpt: scaler.load_state_dict(ckpt["scaler"])
         start_it = int(ckpt.get("it", 0))
         start_epoch = int(ckpt.get("epoch", 0))
+
+        # Try to restore scheduler state; if absent, fast-forward by start_it
+        if scheduler is not None:
+            if resume_path and "scheduler" in ckpt:
+                try:
+                    scheduler.load_state_dict(ckpt["scheduler"])
+                    print("[resume] scheduler state restored.")
+                except Exception as e:
+                    print(f"[resume] scheduler load failed ({e}); fast-forward {start_it} steps.")
+                    for _ in range(start_it):
+                        scheduler.step()
+            elif start_it > 0:
+                print(f"[resume] no scheduler state; fast-forward {start_it} steps.")
+                for _ in range(start_it):
+                    scheduler.step()
+
         best_val = float(ckpt.get("best_score", float("inf")))
         maybe_wandb_id_from_ckpt = ckpt.get("wandb_id", None)
         print(f"[resume] from {resume_path} | it={start_it} epoch={start_epoch} best={best_val:.4f}")
@@ -217,6 +344,7 @@ def main():
         torch.save({
             "it": it, "epoch": ep, "model": model.state_dict(),
             "optim": optim.state_dict(), "scaler": scaler.state_dict(),
+            "scheduler": (scheduler.state_dict() if scheduler is not None else None),
             "args": vars(args), "best_score": best_val,
             "wandb_id": (wandb_run.id if wandb_run is not None else None)
         }, path)
@@ -229,9 +357,13 @@ def main():
             art.add_file(path, name=os.path.basename(path))
             wandb_run.log_artifact(art)
 
+    if wandb_run is not None:
+        wandb_run.log({"amp/dtype": str(torch.get_autocast_gpu_dtype())}, step=it)
+
     # ----------------- Train Loop -----------------
     for ep in range(start_epoch, args.epochs):
-        for batch in tr_dl:
+        pbar = tqdm(tr_dl, desc=f"Epoch {ep+1}/{args.epochs}", dynamic_ncols=True)
+        for batch in pbar:
             it += 1
             ag_h = batch["agents_hist_xy"].to(device)       # (B,Na,Th,2)
             ag_hm= batch["agents_hist_mask"].to(device)     # (B,Na,Th)
@@ -241,7 +373,7 @@ def main():
             gtm  = batch["agents_fut_mask"].to(device)      # (B,Na,Tf)
 
             optim.zero_grad(set_to_none=True)
-            with torch.cuda.amp.autocast(enabled=(device.type=="cuda")):
+            with amp.autocast(device_type='cuda', dtype=amp_dtype, enabled=amp_enabled):
                 if not args.multirollout:
                     pred = model(ag_h, ag_hm, eg_h, eg_hm)   # (B,Na,Tf,2)
                     loss = masked_l2_loss(pred, gt, gtm)
@@ -254,9 +386,13 @@ def main():
             nn.utils.clip_grad_norm_(model.parameters(), max_norm=5.0)
             scaler.step(optim)
             scaler.update()
+            if scheduler is not None:
+                scheduler.step()
 
-            if it % 50 == 0:
-                print(f"[it {it}] loss={loss.item():.4f}")
+            # 更新進度列的 postfix
+            if it % 10 == 0:
+                lr = optim.param_groups[0]["lr"]
+                pbar.set_postfix(loss=f"{loss.item():.4f}", lr=f"{lr:.2e}", it=it)
 
             # wandb log (train)
             if wandb_run is not None and (it % args.log_every == 0):
@@ -273,7 +409,8 @@ def main():
             # validation
             if it % args.val_every == 0:
                 val_m = run_val(model, va_dl, device, args.multirollout, args.miss_thresh, args.K,
-                                wandb_run=wandb_run, step=it)
+                                wandb_run=wandb_run, step=it, show_pbar=True, desc=f"Val@it {it}",
+                                lambda_cls=args.lambda_cls)
                 key = ("minADE_K" if args.multirollout else "macro_ADE")
                 score = val_m.get(key, float("inf"))
                 print(f"[VAL it {it}] {json.dumps(val_m, indent=2)}")
@@ -292,7 +429,7 @@ def main():
 
     # optional: 最後再驗一次
     val_m = run_val(model, va_dl, device, args.multirollout, args.miss_thresh, args.K,
-                    wandb_run=wandb_run, step=it)
+                    wandb_run=wandb_run, step=it, lambda_cls=args.lambda_cls)
     print("[VAL-final]", val_m)
 
     # 若有 test_manifest，就載最好模型去跑

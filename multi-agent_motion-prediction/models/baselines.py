@@ -3,34 +3,53 @@ from __future__ import annotations
 import torch
 import torch.nn as nn
 from torch.nn.utils.rnn import pack_padded_sequence, pad_packed_sequence
+from torch import amp  # 新增
 
 def _lengths_from_mask(mask: torch.Tensor) -> torch.Tensor:
     # mask: (..., T) -> lengths (...,)
     return mask.long().sum(dim=-1).clamp(min=0)
 
-def _encode_gru(gru: nn.GRU, seq: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+def _encode_gru(gru, seq: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
     """
-    seq: (N,T,2), mask: (N,T) bool
-    回傳: (N, H*2) 的雙向「最後一層」隱向量（長度=0 的樣本回 0 向量）
-    支援任意 num_layers；h 形狀為 (num_layers*2, N, H)，h[-2:] 就是最後一層的 fwd/back。
+    seq:  (N, T, D=2)
+    mask: (N, T) bool
+    return: (N, H*dir) 最後一層雙向拼接的 hidden（對於 length=0 的樣本回全 0）
     """
-
     N, T, D = seq.shape
-    lens = _lengths_from_mask(mask)  # (N,)
-    # 避免空序列：全 0 也能 pack，但需排序
-    lens_cpu = lens.cpu()
-    lens_sorted, idx_sort = torch.sort(lens_cpu, descending=True)
-    idx_unsort = torch.argsort(idx_sort).to(seq.device)
-    seq_sorted = seq.index_select(0, idx_sort.to(seq.device))
-    # pack
-    packed = pack_padded_sequence(seq_sorted, lengths=lens_sorted, batch_first=True, enforce_sorted=True)
-    _, h = gru(packed)  # h: (num_layers*2, N, H)
-    h_last = h[-2:].transpose(0,1).reshape(N, -1)  # 取最後一層雙向 -> (N, 2H)
-    # 還原順序
-    h_last = h_last.index_select(0, idx_unsort)
-    # 對於 length=0 的樣本，置零（pack 裡會當成 0）
-    zero_mask = (lens == 0).unsqueeze(-1) #(N, 1)
-    h_last = torch.where(zero_mask, torch.zeros_like(h_last), h_last) #(N, H*2)
+    device = seq.device
+    num_dir = 2 if gru.bidirectional else 1
+    H = gru.hidden_size
+
+    lens = _lengths_from_mask(mask)              # (N,)
+    h_last = seq.new_zeros((N, H * num_dir))     # 先準備輸出緩衝
+
+    nonzero = (lens > 0) #(N, ) bool
+    if nonzero.any():
+        idx_nz = torch.nonzero(nonzero, as_tuple=False).squeeze(1)  # 有效樣本 index, (M, ), long
+        seq_nz = seq.index_select(0, idx_nz) #(M, T, D)
+        len_nz = lens.index_select(0, idx_nz) #(M, )
+
+        # 依長度排序（pack 需要）
+        len_sorted, idx_sort = torch.sort(len_nz.cpu(), descending=True) #(M, ) (M, )
+        seq_sorted = seq_nz.index_select(0, idx_sort.to(device)) #(M, T, D)
+
+        packed = pack_padded_sequence(
+            seq_sorted, lengths=len_sorted, batch_first=True, enforce_sorted=True
+        ) #()
+        with amp.autocast(device_type='cuda', enabled=False):
+            _, h = gru(packed)                      # h: (num_layers*num_dir, M, H)
+
+        # 取「最後一層」的雙向 hidden，拼成 (N', H*dir)
+        h_last_layer = h[-num_dir:]             # (num_dir, M, H)
+        h_last_layer = h_last_layer.transpose(0, 1).reshape(-1, H * num_dir) #(M, H*num_dir)
+
+        # 還原 pack 的排序
+        inv_sort = torch.argsort(idx_sort).to(device)
+        h_last_nz = h_last_layer.index_select(0, inv_sort) #(M, H*num_dir)
+
+        # 填回對應位置；零長度的樣本保持 0
+        h_last.index_copy_(0, idx_nz, h_last_nz) #(N, H*num_dir)
+
     return h_last
 
 class GRUSingleRollout(nn.Module):
@@ -40,16 +59,10 @@ class GRUSingleRollout(nn.Module):
         self.Th, self.Tf = Th, Tf
         H = hidden // 2  # 雙向 => 總 hidden = 2H
 
-        self.ag_enc = nn.GRU(
-            input_size=2, hidden_size=H,
-            batch_first=True, bidirectional=True,
-            num_layers=num_layers, dropout=dropout       #兩層 + 跨層 dropout
-        )
-        self.ego_enc = nn.GRU(
-            input_size=2, hidden_size=H,
-            batch_first=True, bidirectional=True,
-            num_layers=num_layers, dropout=dropout
-        )
+        self.ag_enc = nn.GRU(2, H, num_layers=num_layers, batch_first=True,
+                            bidirectional=True, dropout=0.0 if num_layers==1 else 0.1)#兩層 + 跨層 dropout
+        self.ego_enc = nn.GRU(2, H, num_layers=num_layers, batch_first=True,
+                            bidirectional=True, dropout=0.0 if num_layers==1 else 0.1)#兩層 + 跨層 dropout
 
         self.fuse = nn.Sequential(
             nn.Linear(4*H, d_model),

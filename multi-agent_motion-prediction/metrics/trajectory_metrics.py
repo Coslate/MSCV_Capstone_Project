@@ -24,14 +24,17 @@ def ade_fde_single(
     """
     回傳：
       - macro_ADE / micro_ADE
-      - macro_FDE / micro_FDE（對 FDE 其實 macro/micro 相同，皆對「有末步」的 agent 平均）
-      - per_agent_ADE/FDE（(B,Na)；供日後分析）
+      - macro_FDE / micro_FDE(對 FDE 其實 macro/micro 相同，皆對「有末步」的 agent 平均)
+      - per_agent_ADE/FDE((B,Na)；供日後分析)
     """
     assert pred.shape == gt.shape
     assert mask.shape == pred.shape[:3]
     B, Na, Tf, _ = pred.shape
 
-    d = torch.linalg.norm(pred - gt, dim=-1)  # (B,Na,Tf)
+    valid = mask.unsqueeze(-1)                          # (B,Na,Tf,1)
+    pred_v = torch.where(valid, pred, torch.zeros_like(pred))
+    gt_v   = torch.where(valid, gt,   torch.zeros_like(gt))
+    d = torch.linalg.norm(pred_v - gt_v, dim=-1)       # (B,Na,Tf)
 
     # ADE
     valid_counts = mask.sum(dim=-1).clamp(min=1)            # (B,Na)
@@ -75,8 +78,13 @@ def metrics_multirollout(
     """
     B, Na, K, Tf, _ = pred_k.shape
 
-    # L2 over time
-    d = torch.linalg.norm(pred_k - gt.unsqueeze(2), dim=-1)  # (B,Na,K,Tf)
+    # L2 over time (NaN-safe)
+    valid = mask.unsqueeze(2).unsqueeze(-1)                  # (B,Na,K,Tf,1)
+    gt_e  = gt.unsqueeze(2)                                  # (B,Na,1,Tf,2)
+    pred_v = torch.where(valid, pred_k, torch.zeros_like(pred_k))
+    gt_v   = torch.where(valid, gt_e,   torch.zeros_like(gt_e))
+    d = torch.linalg.norm(pred_v - gt_v, dim=-1)            # (B,Na,K,Tf)
+
     # ADE per (B,Na,K)
     valid_counts = mask.sum(dim=-1).clamp(min=1).unsqueeze(2)  # (B,Na,1)
     ade_bnk = (d * mask.unsqueeze(2)).sum(-1) / valid_counts   # (B,Na,K)
