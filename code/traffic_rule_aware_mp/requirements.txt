@@ -10,9 +10,9 @@ tqdm>=4.64
 nuscenes-devkit>=1.1.10
 
 # Argoverse 2 (Sensor)
-av2>=0.2.2
+#av2>=0.2.2
 
 # Waymo Perception (with maps for v1.4.2/1.4.3)
 # TensorFlow build must match the wheel name; adjust for your platform/Python.
-tensorflow==2.11.0
-waymo-open-dataset-tf-2-11-0; platform_system != "Windows"
+#tensorflow==2.11.0
+#waymo-open-dataset-tf-2-11-0; platform_system != "Windows"

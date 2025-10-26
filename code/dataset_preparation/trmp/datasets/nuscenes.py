@@ -67,6 +67,68 @@ def _get_agents_histories_aligned(nusc, instance_tokens: List[str], t0_sample_to
         out[inst] = {"xy": xy, "yaw": yaw, "mask": mask}
     return tokens, out
 
+def _future_tokens(nusc, t0_sample_token: str, seconds: float) -> List[str]:
+    """Collect sample_tokens from t1 -> t{+} within the next `seconds` window (exclude t0)."""
+    s0 = nusc.get('sample', t0_sample_token)
+    t0 = s0['timestamp']
+    tokens = []
+    cur = s0
+    max_steps = int(np.ceil(seconds * 2.0))  # 2Hz keyframes
+    while cur.get('next') and len(tokens) < max_steps:
+        nxt_tok = cur['next']; nxt_s = nusc.get('sample', nxt_tok)
+        if (nxt_s['timestamp'] - t0)/1e6 > seconds: break
+        tokens.append(nxt_tok); cur = nxt_s
+    return tokens  # ascending (t1 -> ...)
+
+def _get_agents_futures_aligned(nusc, instance_tokens: List[str], t0_sample_token: str, seconds: float):
+    """
+    Like _get_agents_histories_aligned, but for FUTURE (exclude t0).
+    Returns:
+      tokens: [Tf] (t1->t{+})
+      out: dict[instance_token] = {'xy':[Tf,2], 'yaw':[Tf], 'mask':[Tf]}
+    """
+    tokens = _future_tokens(nusc, t0_sample_token, seconds)
+    T = len(tokens)
+    out = {}
+    for inst in instance_tokens:
+        annmap = _instance_ann_map(nusc, inst)
+        xy   = np.full((T, 2), 0, dtype=np.float32)
+        yaw  = np.full((T,),   0, dtype=np.float32)
+        mask = np.zeros((T,),   dtype=bool)
+        for i, tok in enumerate(tokens):
+            ann = annmap.get(tok)
+            if ann is None: 
+                continue
+            x, y, _ = ann['translation']
+            qw, qx, qy, qz = ann['rotation']
+            th = np.arctan2(2*(qw*qz + qx*qy), 1 - 2*(qy*qy + qz*qz))
+            xy[i] = [x, y]; yaw[i] = th; mask[i] = True
+        out[inst] = {"xy": xy, "yaw": yaw, "mask": mask}
+    return tokens, out
+
+def _get_ego_future(
+    nusc,
+    sample_token: str,
+    seconds: float = 6.0,
+    tokens: List[str] = None
+) -> np.ndarray:
+    """
+    Return ego future as [[x, y, yaw], ...] in WORLD frame, t1->t{+}.
+    If `tokens` given, must be the FUTURE grid returned by _future_tokens.
+    """
+    if tokens is None:
+        tokens = _future_tokens(nusc, sample_token, seconds)
+    xy_yaw = []
+    for tok in tokens:
+        s = nusc.get('sample', tok)
+        lidar_sd = nusc.get('sample_data', s['data']['LIDAR_TOP'])
+        ego_pose = nusc.get('ego_pose', lidar_sd['ego_pose_token'])
+        x, y, _ = ego_pose['translation']
+        qw, qx, qy, qz = ego_pose['rotation']
+        yaw = np.arctan2(2*(qw*qz + qx*qy), 1 - 2*(qy*qy + qz*qz))
+        xy_yaw.append([x, y, yaw])
+    return np.array(xy_yaw, dtype=np.float32)
+
 def _get_agent_history(nusc, instance_token: str, t0_sample_token: str, seconds: float = 4.0) -> np.ndarray:
     """
     Return agent history as [[x, y, yaw], ...] in WORLD frame, oldest->t0.
@@ -132,45 +194,50 @@ def _get_ego_history(
 
     return np.array(xy_yaw, dtype=np.float32)
 
-'''
-def _get_ego_history(nusc, sample_token: str, seconds: float = 4.0) -> np.ndarray:
-    sample = nusc.get('sample', sample_token)
-    tokens = [sample_token]; t0 = sample['timestamp']; cur = sample
-    max_steps = int(np.ceil(seconds * 2.5)) + 1
-    while cur.get('prev') and len(tokens) < max_steps:
-        prev_tok = cur['prev']; prev_s = nusc.get('sample', prev_tok)
-        if (t0 - prev_s['timestamp'])/1e6 > seconds: break
-        tokens.append(prev_tok); cur = prev_s
-    tokens = tokens[::-1]
-    xy_yaw = []
-    for tok in tokens:
-        s = nusc.get('sample', tok)
-        lidar_sd = nusc.get('sample_data', s['data']['LIDAR_TOP'])
-        ego_pose = nusc.get('ego_pose', lidar_sd['ego_pose_token'])
-        x, y, _ = ego_pose['translation']
-        qw, qx, qy, qz = ego_pose['rotation']
-        yaw = np.arctan2(2*(qw*qz + qx*qy), 1 - 2*(qy*qy + qz*qz))
-        xy_yaw.append([x, y, yaw])
-    return np.array(xy_yaw, dtype=np.float32)
-'''
-
 def _map_slice_tokens(nmap, ex: float, ey: float, radius: float) -> Dict[str, List[str]]:
-    def rec(layer):
-        try: return nmap.get_records_in_radius(ex, ey, radius, layer)
-        except Exception: return []
+    """Return tokens around (ex, ey) within radius for unified map layers."""
+    ex = float(ex); ey = float(ey); radius = float(radius)
+
+    def rec(layer: str) -> List[str]:
+        try:
+            # get_records_in_radius 期待 list[str]
+            out = nmap.get_records_in_radius(ex, ey, radius, [layer])
+            return out.get(layer, [])
+        except Exception as e:
+            print(f"[HDMap] get_records_in_radius(layer='{layer}') failed: {e}")
+            return []
+
+    # 中心線同時包含 lane 與 lane_connector（Option A）
+    lane = rec("lane")
+    lane_conn = rec("lane_connector")
+    lane_tokens = lane+lane_conn
+
     return {
-        "lane_center": rec('lane'),
-        "lane_boundary": rec('lane_divider'),
-        "road_boundary": rec('road_divider'),
-        "crosswalk": rec('ped_crossing'),
-        "stop_line_or_sign": rec('stop_line'),
+        "lane_center":   lane_tokens,       # 合併給畫中心線用
+        "lane_connector": lane_conn,        # 額外保留，方便統計/調試/特殊樣式
+        "lane_divider":  rec("lane_divider"),
+        "road_divider":  rec("road_divider"),
+        "ped_crossing":  rec("ped_crossing"),
+        "stop_line":     rec("stop_line"),
+        "traffic_light": rec("traffic_light"),
     }
 
-def load_sample(nuscenes_root: str, sample_token: str, past_sec: float = 4.0, map_radius_m: float = 80.0) -> Dict[str, Any]:
+def load_sample(
+    nuscenes_root: str,
+    sample_token: str,
+    past_sec: float = 4.0,
+    future_sec: float = 6.0,
+    map_radius_m: float = 80.0,
+    *,
+    version: str = "v1.0-trainval",
+    nusc=None,                 # <-- 新增：可傳入共用 NuScenes 物件
+    nmap_cache: dict = None    # <-- 新增：共用 NuScenesMap cache (location)
+) -> Dict[str, Any]:    
     """Return a unified sample dict for one nuScenes keyframe sample."""
     NuScenes, PredictHelper, NuScenesMap = _optional_import()
-    nusc = NuScenes(version='v1.0-trainval', dataroot=nuscenes_root)
-    helper = PredictHelper(nusc)
+    if nusc is None:
+        nusc = NuScenes(version=version, dataroot=nuscenes_root, verbose=False)
+
     sample = nusc.get('sample', sample_token)
 
     # 1) image 路徑（keyframe）
@@ -216,58 +283,53 @@ def load_sample(nuscenes_root: str, sample_token: str, past_sec: float = 4.0, ma
             "size": meta["size"],
         }
 
-    '''
-    agents_history = {}
-    for ann_token in sample['anns']:
-        ann = nusc.get('sample_annotation', ann_token)
-        inst_tok = ann['instance_token']
-
-        # 用四元數（與 ego 相同做法）取回 [x,y,yaw]，時間順序為 oldest->t0
-        xy_yaw = _get_agent_history(nusc, inst_tok, sample_token, seconds=past_sec)
-
-        # 若這個 agent 在該視窗內完全不存在就略過（可選：也可保留空陣列）
-        if xy_yaw.size == 0:
-            continue
-
-        agents_history[inst_tok] = {
-            "xy":  xy_yaw[:, :2].astype(np.float32),
-            "yaw": xy_yaw[:, 2].astype(np.float32),
-            "type": ann['category_name'],
-            "size": list(map(float, ann['size'])),
-        }
-    '''
-
-    '''
-    agents_history = {}
-    for ann_token in sample['anns']:
-        ann = nusc.get('sample_annotation', ann_token)
-        past_xy = helper.get_past_for_agent(ann['instance_token'], sample_token, seconds=past_sec, in_agent_frame=False)
-        past_yaw = np.zeros((past_xy.shape[0],), dtype=np.float32)  # yaw not directly provided; fill zeros or compute from heading change.
-        agents_history[ann['instance_token']] = {
-            "xy": past_xy.astype(np.float32),
-            "yaw": past_yaw,
-            "type": ann['category_name'],
-            "size": list(map(float, ann['size']))
-        }
-    '''
-
-    # 4) ego 歷史
-    #ego_history = _get_ego_history(nusc, sample_token, seconds=past_sec)
+    # 4a) ego history (x: data)
     ego_history = _get_ego_history(nusc, sample_token, seconds=past_sec, tokens=tokens_hist)
+
+    # 4b) ego future（y: labels）：以 t0 畫面上的 instances 對齊取未來 Tf 步（exclude t0）
+    tokens_fut, aligned_fut = _get_agents_futures_aligned(
+        nusc, inst_at_t0, sample_token, seconds=future_sec
+    )
+
+    agents_future = {}
+    for inst in inst_at_t0:
+        af = aligned_fut.get(inst, None)
+        if af is None:
+            continue
+        meta = inst_meta[inst]
+        agents_future[inst] = {
+            "xy":   af["xy"],     # [Tf,2] world
+            "yaw":  af["yaw"],    # [Tf]
+            "mask": af["mask"],   # [Tf]
+            "type": meta["type"],
+            "size": meta["size"],
+        }
+
+    ego_future = _get_ego_future(nusc, sample_token, seconds=future_sec, tokens=tokens_fut)
+
 
     # 5) 地圖切片（回 token；需要座標可用 map API 再展開）
     scene = nusc.get('scene', sample['scene_token'])
     log = nusc.get('log', scene['log_token'])
-    nmap = NuScenesMap(dataroot=nuscenes_root, map_name=log['location'])
+    map_name = log['location']
+
+    if nmap_cache is not None:
+        if map_name not in nmap_cache:
+            nmap_cache[map_name] = NuScenesMap(dataroot=nuscenes_root, map_name=map_name)
+        nmap = nmap_cache[map_name]
+    else:
+        # 沒提供 cache 就自己建（單次）
+        nmap = NuScenesMap(dataroot=nuscenes_root, map_name=map_name)
+
     ego_pose = nusc.get('ego_pose', lidar_sd['ego_pose_token'])
     ex, ey = ego_pose['translation'][:2]
     map_dict = _map_slice_tokens(nmap, ex, ey, map_radius_m)
 
     # 6) 取 calib and t0 參考（用 LIDAR_TOP 的 ego_pose）
     calib_sensor_t0 = nusc.get('calibrated_sensor', lidar_sd['calibrated_sensor_token'])
-    R_el = Quaternion(calib_sensor_t0["rotation"]).rotation_matrix
+    R_el = Quaternion(calib_sensor_t0["rotation"]).rotation_matrix #ego <- lidar
     t_el = np.array(calib_sensor_t0["translation"], dtype=np.float32)
-    pose_t0  = nusc.get('ego_pose', lidar_sd['ego_pose_token'])
+    pose_t0  = nusc.get('ego_pose', lidar_sd['ego_pose_token'])    #world <- ego
     R_we = Quaternion(pose_t0['rotation']).rotation_matrix
     t_we = np.array(pose_t0['translation'], dtype=np.float32)
 
@@ -283,6 +345,8 @@ def load_sample(nuscenes_root: str, sample_token: str, past_sec: float = 4.0, ma
         t_es = np.array(cal['translation'], dtype=np.float32)
 
         entry = {
+            "channel": sd["channel"],
+            "modality": sd["sensor_modality"],      # 'camera' | 'lidar' | 'radar'
             "ego_from_sensor": {"R": R_es.tolist(), "t": t_es.tolist()},
             "timestamp": sd["timestamp"],
             "sample_data_token": sd_token,
@@ -300,9 +364,12 @@ def load_sample(nuscenes_root: str, sample_token: str, past_sec: float = 4.0, ma
         "ego_history": ego_history,
         "history_tokens": tokens_hist,
         "agents_history": agents_history,
+        "future_tokens": tokens_fut,
+        "ego_future": ego_future,
+        "agents_future": agents_future,
         "map": map_dict,
         "timestamps": {"t0": sample['timestamp'], "history_hz": 2.0, "lidar_hz": 20.0, "cam_hz": 12.0},
-        "city_or_map_id": log['location'],
+        "city_or_map_id": map_name,
         "t0": {
                 "lidar_filename": str(Path(nuscenes_root) / lidar_sd['filename']),
                 "calib_rot": R_el,
