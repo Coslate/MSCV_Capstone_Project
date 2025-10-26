@@ -112,7 +112,7 @@ python -m scripts.train \
   --wandb --wandb_project multi-agent-motion-prediction --wandb_run_name mmp_bl_single_2k \
   --log_every 1
 
-# Train on full dataset
+# Train on full dataset - baseline model GRU
 python -m scripts.train \
   --train_manifest /data/patrick/packed_nuscenes_v1/splits/manifest.train.jsonl \
   --val_manifest   /data/patrick/packed_nuscenes_v1/splits/manifest.val.jsonl \
