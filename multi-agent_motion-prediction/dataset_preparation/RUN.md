@@ -77,3 +77,30 @@ python scripts/sanity_npz_shapes.py \
 python scripts/sanity_npz_shapes.py \
   --manifest /data/patrick/packed_nuscenes_v2_parallel/manifest.jsonl \
   --random
+
+
+# Dataset Split
+python scripts/make_splits.py \
+  --manifest /data/patrick/packed_nuscenes_v1/manifest.jsonl \
+  --out_dir /data/patrick/packed_nuscenes_v1/splits \
+  --train_ratio 0.8 --val_ratio 0.1 --test_ratio 0.1 --seed 2025
+
+python scripts/make_splits.py \
+  --manifest /data/patrick/packed_nuscenes_v2_parallel/manifest.jsonl \
+  --out_dir /data/patrick/packed_nuscenes_v2_parallel/splits \
+  --train_ratio 0.8 --val_ratio 0.1 --test_ratio 0.1 --seed 2025
+
+head -n 2000 /data/patrick/packed_nuscenes_v1/splits/manifest.train.jsonl > /data/patrick/packed_nuscenes_v1/splits/mini/manifest.train_5k.jsonl
+head -n 500 /data/patrick/packed_nuscenes_v1/splits/manifest.val.jsonl > /data/patrick/packed_nuscenes_v1/splits/mini/manifest.val_500.jsonl
+
+# Train on mini for testing
+python scripts/train.py \
+  --train_manifest /data/patrick/packed_nuscenes_v1/splits/mini/manifest.train_5k.jsonl \
+  --val_manifest   /data/patrick/packed_nuscenes_v1/splits/mini/manifest.val_500.jsonl \
+  --batch_size 32 \
+  --epochs 1 \
+  --val_every 100 \
+  --lr 1e-3 \
+  --hidden 128 --num_layers 1 --d_model 128 \
+  --device cuda \
+  --out_dir runs/baseline_single_2k
