@@ -164,3 +164,48 @@ python -m scripts.train \
   --out_dir runs/mmp_bl_fulldataset_12k_lr_warmupcos_lr3e-3_wup0.05_minlr3e-4_e15 \
   --wandb --wandb_project multi-agent-motion-prediction --wandb_run_name mmp_bl_fulldataset_12k_lr_warmupcos_lr3e-3_wup0.05_minlr3e-4_e15 \
   --log_every 10
+
+
+# Evaluation baseline (not run yet)
+## Use FDE rank and select top worse 30 to save CSV+visualization for analyze (single rollout)
+python -m scripts.eval \
+  --manifest /data/.../manifest.test.jsonl \
+  --ckpt runs/.../best.pt \
+  --batch_size 64 --device cuda \
+  --rank_by FDE \
+  --topk_vis 30 --save_vis_dir runs/.../vis_top30_fde \
+  --dump_csv runs/.../test_per_agent.csv \
+  --vis_with_map
+
+## Use FDE rank and select top worse 50 to save CSV+visualization for analyze (multi rollout)
+python -m scripts.eval \
+  --manifest /data/.../manifest.test.jsonl \
+  --ckpt runs/.../best.pt \
+  --multirollout --K 6 \
+  --rank_by minADE_K \
+  --topk_vis 50 --save_vis_dir runs/.../vis_top50_minADEK \
+  --dump_csv runs/.../test_per_agent.csv
+
+## Simple visualization, no selecting top worse, draw single idx with all agents in it.
+python -m scripts.visualize \
+  --manifest /data/.../manifest.val.jsonl \
+  --ckpt runs/.../best.pt \
+  --device cuda \
+  --out_dir runs/.../viz_single \
+  single --idx 1234 --include_map
+
+## Simple visualization, no selecting top worse, draw single idx with single agents in it.
+python -m scripts.visualize \
+  --manifest /data/.../manifest.val.jsonl \
+  --ckpt runs/.../best.pt \
+  --device cuda \
+  --out_dir runs/.../viz_single_agent7 \
+  single --idx 1234 --agent 7 --include_map
+
+## Simple visualization, no selecting top worse, draw sequence idx with single agents in it.
+python -m scripts.visualize \
+  --manifest /data/.../manifest.val.jsonl \
+  --ckpt runs/.../best.pt \
+  --device cuda \
+  --out_dir runs/.../viz_sequence_sceneX \
+  sequence --start_idx 5000 --num 120 --ensure_same_scene --include_map --fps 10 --make_video
